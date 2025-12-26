@@ -200,11 +200,11 @@ expected_key = "2b7e151628aed2a6abf7158809cf4f3c"
 expected_bytes = bytes.fromhex(expected_key)
 
 attack_configs = [
-    ('last_round', 'hw', ciphertexts_all, 'Last Round - Hamming Weight: HW(InvSBox(CT⊕k))'),
-    ('last_round', 'hd', ciphertexts_all, 'Last Round - Hamming Distance: HD(CT, InvSBox(CT⊕k))'),
-    ('last_round', 'hd_sbox', ciphertexts_all, 'Last Round - S-box HD: HD(CT⊕k, InvSBox(CT⊕k))'),
-    ('first_round', 'hw', plaintexts_all, 'First Round - Hamming Weight: HW(SBox(PT⊕k))'),
-    ('first_round', 'hd', plaintexts_all, 'First Round - Hamming Distance: HD(PT, SBox(PT⊕k))'),
+    ('last_round', 'hw', ciphertexts_all, 'Last Round - Hamming Weight: HW(InvSBox(CT^k))'),
+    ('last_round', 'hd', ciphertexts_all, 'Last Round - Hamming Distance: HD(CT, InvSBox(CT^k))'),
+    ('last_round', 'hd_sbox', ciphertexts_all, 'Last Round - S-box HD: HD(CT^k, InvSBox(CT^k))'),
+    ('first_round', 'hw', plaintexts_all, 'First Round - Hamming Weight: HW(SBox(PT^k))'),
+    ('first_round', 'hd', plaintexts_all, 'First Round - Hamming Distance: HD(PT, SBox(PT^k))'),
 ]
 
 results = {}
@@ -264,7 +264,7 @@ for byte_idx in range(16):
     top3 = np.argsort(corrs)[-3:][::-1]
     expected_byte = expected_bytes[byte_idx]
     recovered = best_key[byte_idx]
-    match = "✓" if recovered == expected_byte else "✗"
+    match = "[OK]" if recovered == expected_byte else "[X]"
     print(f"Byte {byte_idx:2d}: 0x{recovered:02x} (exp: 0x{expected_byte:02x}) {match} | "
           f"corr={corrs[recovered]:.4f} | 2nd: 0x{top3[1]:02x}({corrs[top3[1]]:.4f})")
 
@@ -325,7 +325,7 @@ for byte_idx in range(16):
         ax.plot(peak_idx, peak_val, 'r*', markersize=10)
         ax.axhline(peak_val, color='red', linestyle='--', alpha=0.5, linewidth=0.5)
     
-    match = "✓" if best_key[byte_idx] == expected_bytes[byte_idx] else "✗"
+    match = "[OK]" if best_key[byte_idx] == expected_bytes[byte_idx] else "[X]"
     ax.set_title(f'Byte {byte_idx}: 0x{best_key[byte_idx]:02X} {match} (r={best_correlations[byte_idx]:.3f})', 
                  fontsize=10)
     ax.set_xlabel('Sample', fontsize=8)
