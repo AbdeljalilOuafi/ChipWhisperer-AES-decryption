@@ -133,7 +133,7 @@ print("Target: XMEGA CW308 with TinyAES128")
 print("=" * 60)
 
 print("\nCapturing traces...")
-N_traces = 5000
+N_traces = 2000  # Reduced for faster testing
 traces_all = []
 ciphertexts_all = []
 plaintexts_all = []
@@ -152,7 +152,7 @@ for i in range(N_traces):
             ciphertexts_all.append(list(ct))
             plaintexts_all.append(list(pt))
     
-    if (i + 1) % 1000 == 0:
+    if (i + 1) % 500 == 0:
         print(f"  {i + 1}/{N_traces} traces captured")
 
 traces_all = np.array(traces_all, dtype=np.float64)
@@ -171,62 +171,66 @@ traces_std[traces_std < 1e-10] = 1.0
 traces_norm = (traces_all - traces_mean) / traces_std
 
 # =============================================================================
-# First Round Attack: HW(SBox(PT ^ k))
+# First Round Attack: HW(SBox(PT ^ k)) - COMMENTED OUT FOR SPEED
 # =============================================================================
-print("\n" + "=" * 60)
-print("FIRST ROUND ATTACK")
-print("Power Model: HW(SBox(PT ^ k))")
-print("=" * 60)
+# print("\n" + "=" * 60)
+# print("FIRST ROUND ATTACK")
+# print("Power Model: HW(SBox(PT ^ k))")
+# print("=" * 60)
 
 expected_key = "2b7e151628aed2a6abf7158809cf4f3c"
 expected_bytes = bytes.fromhex(expected_key)
 
+# Initialize variables (needed for graphs even if first round is skipped)
 first_round_key = np.zeros(16, dtype=np.uint8)
 first_round_corr = np.zeros(16, dtype=np.float64)
 first_round_all_corr = np.zeros((16, 256), dtype=np.float64)
-first_round_traces = {}
+first_round_traces = {i: None for i in range(16)}
+first_key_hex = "skipped"
+first_matches = 0
 
-for byte_idx in range(16):
-    print(f"Byte {byte_idx:2d}: ", end="", flush=True)
-    
-    pt_column = plaintexts_all[:, byte_idx]
-    max_corr = np.zeros(256, dtype=np.float64)
-    best_trace = None
-    
-    for kguess in range(256):
-        if kguess % 64 == 0:
-            print(".", end="", flush=True)
-        
-        # First round: HW(SBox(PT ^ k))
-        inter = SBOX[pt_column ^ kguess]
-        hyp = HW[inter].astype(np.float64)
-        
-        hyp_c = hyp - hyp.mean()
-        hyp_std = hyp_c.std()
-        if hyp_std < 1e-10:
-            continue
-        hyp_n = hyp_c / hyp_std
-        
-        corr = np.abs(np.dot(hyp_n, traces_norm) / n_traces)
-        max_corr[kguess] = np.max(corr)
-        
-        if max_corr[kguess] >= max_corr.max():
-            best_trace = corr.copy()
-    
-    best = np.argmax(max_corr)
-    first_round_key[byte_idx] = best
-    first_round_corr[byte_idx] = max_corr[best]
-    first_round_all_corr[byte_idx] = max_corr
-    first_round_traces[byte_idx] = best_trace
-    
-    match = "[OK]" if best == expected_bytes[byte_idx] else "[X]"
-    print(f" 0x{best:02x} {match} (corr={max_corr[best]:.4f})")
-
-first_key_hex = "".join(f"{b:02x}" for b in first_round_key)
-first_matches = sum(1 for i in range(16) if first_round_key[i] == expected_bytes[i])
-print(f"\nFirst Round Key: {first_key_hex}")
-print(f"Expected:        {expected_key}")
-print(f"Matches: {first_matches}/16, Avg correlation: {first_round_corr.mean():.4f}")
+# FIRST ROUND ATTACK COMMENTED OUT - Uncomment below to run it
+# for byte_idx in range(16):
+#     print(f"Byte {byte_idx:2d}: ", end="", flush=True)
+#     
+#     pt_column = plaintexts_all[:, byte_idx]
+#     max_corr = np.zeros(256, dtype=np.float64)
+#     best_trace = None
+#     
+#     for kguess in range(256):
+#         if kguess % 64 == 0:
+#             print(".", end="", flush=True)
+#         
+#         # First round: HW(SBox(PT ^ k))
+#         inter = SBOX[pt_column ^ kguess]
+#         hyp = HW[inter].astype(np.float64)
+#         
+#         hyp_c = hyp - hyp.mean()
+#         hyp_std = hyp_c.std()
+#         if hyp_std < 1e-10:
+#             continue
+#         hyp_n = hyp_c / hyp_std
+#         
+#         corr = np.abs(np.dot(hyp_n, traces_norm) / n_traces)
+#         max_corr[kguess] = np.max(corr)
+#         
+#         if max_corr[kguess] >= max_corr.max():
+#             best_trace = corr.copy()
+#     
+#     best = np.argmax(max_corr)
+#     first_round_key[byte_idx] = best
+#     first_round_corr[byte_idx] = max_corr[best]
+#     first_round_all_corr[byte_idx] = max_corr
+#     first_round_traces[byte_idx] = best_trace
+#     
+#     match = "[OK]" if best == expected_bytes[byte_idx] else "[X]"
+#     print(f" 0x{best:02x} {match} (corr={max_corr[best]:.4f})")
+# 
+# first_key_hex = "".join(f"{b:02x}" for b in first_round_key)
+# first_matches = sum(1 for i in range(16) if first_round_key[i] == expected_bytes[i])
+# print(f"\nFirst Round Key: {first_key_hex}")
+# print(f"Expected:        {expected_key}")
+# print(f"Matches: {first_matches}/16, Avg correlation: {first_round_corr.mean():.4f}")
 
 # =============================================================================
 # Last Round Attack: HW(InvSBox(CT ^ k))
