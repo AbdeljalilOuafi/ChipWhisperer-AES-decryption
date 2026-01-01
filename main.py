@@ -10,7 +10,7 @@ scope = cw.scope()
 target = cw.target(scope, cw.targets.SimpleSerial)
 scope.default_setup()
 
-# Optimized scope settings for XMEGA target
+# Scope settings for XMEGA target
 scope.clock.clkgen_freq = 7370000  # 7.37 MHz for XMEGA
 scope.adc.samples = 24000          # Capture enough samples for full AES
 scope.adc.offset = 0
@@ -28,7 +28,7 @@ if hasattr(scope, 'io'):
     time.sleep(0.05)
 
 # =============================================================================
-# AES S-Box and Inverse S-Box
+# AES Tables and Key Schedule
 # =============================================================================
 SBOX = np.array([
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
@@ -68,16 +68,68 @@ ISBOX = np.array([
     0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
 ], dtype=np.uint8)
 
-# Hamming Weight lookup table
+# Hamming Weight lookup
 HW = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
+
+# AES Round Constants
+RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+
+# InvShiftRows mapping: tells which ciphertext byte corresponds to which state byte
+# In the last round: CT = ShiftRows(SubBytes(state9)) XOR key10
+# To undo ShiftRows when attacking, we need this mapping
+INVSHIFT = [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11]
+
+def key_schedule_rounds(key, start_round, end_round):
+    """
+    Apply AES key schedule from start_round to end_round.
+    If start_round > end_round, applies inverse key schedule.
+    """
+    key = np.array(list(key), dtype=np.uint8)
+    
+    if start_round < end_round:
+        # Forward key schedule
+        for r in range(start_round, end_round):
+            # RotWord + SubWord + Rcon for first column
+            temp = np.array([
+                SBOX[key[13]] ^ RCON[r],
+                SBOX[key[14]],
+                SBOX[key[15]],
+                SBOX[key[12]]
+            ], dtype=np.uint8)
+            
+            # XOR with previous round key
+            new_key = np.zeros(16, dtype=np.uint8)
+            new_key[0:4] = key[0:4] ^ temp
+            new_key[4:8] = key[4:8] ^ new_key[0:4]
+            new_key[8:12] = key[8:12] ^ new_key[4:8]
+            new_key[12:16] = key[12:16] ^ new_key[8:12]
+            key = new_key
+    else:
+        # Inverse key schedule (going backwards)
+        for r in range(start_round - 1, end_round - 1, -1):
+            new_key = np.zeros(16, dtype=np.uint8)
+            new_key[12:16] = key[12:16] ^ key[8:12]
+            new_key[8:12] = key[8:12] ^ key[4:8]
+            new_key[4:8] = key[4:8] ^ key[0:4]
+            
+            # Inverse of RotWord + SubWord + Rcon
+            temp = np.array([
+                SBOX[new_key[13]] ^ RCON[r],
+                SBOX[new_key[14]],
+                SBOX[new_key[15]],
+                SBOX[new_key[12]]
+            ], dtype=np.uint8)
+            new_key[0:4] = key[0:4] ^ temp
+            key = new_key
+    
+    return bytes(key)
 
 # =============================================================================
 # Trace Capture
 # =============================================================================
 print("=" * 60)
-print("CPA Attack on AES Last Round")
+print("CPA Attack on AES")
 print("Target: XMEGA CW308 with TinyAES128")
-print("Power Model: Hamming Distance")
 print("=" * 60)
 
 print("\nCapturing traces...")
@@ -111,160 +163,206 @@ n_traces, n_samples = traces_all.shape
 print(f"\nTotal valid traces: {n_traces}")
 print(f"Samples per trace: {n_samples}")
 
-# =============================================================================
-# Preprocessing: Normalize traces
-# =============================================================================
-print("\nPreprocessing traces...")
+# Normalize traces
+print("Preprocessing traces...")
 traces_mean = traces_all.mean(axis=0)
 traces_std = traces_all.std(axis=0)
 traces_std[traces_std < 1e-10] = 1.0
 traces_norm = (traces_all - traces_mean) / traces_std
 
 # =============================================================================
-# CPA Attack - Last Round with Hamming Distance
+# First Round Attack: HW(SBox(PT ^ k))
 # =============================================================================
-# 
-# HAMMING DISTANCE MODEL FOR LAST ROUND:
-# 
-# In the last round of AES, the S-box output transitions to the final ciphertext.
-# The power consumption is proportional to the number of bit flips during this
-# transition.
-#
-# For each byte:
-#   - S-box input: CT[i] ^ k[i] (before InvSubBytes in reverse)
-#   - S-box output: InvSBox(CT[i] ^ k[i])
-#   
-# Hamming Distance = HW(S-box_input XOR S-box_output)
-#                  = HW((CT[i] ^ k[i]) XOR InvSBox(CT[i] ^ k[i]))
-#
-# This models the bit transitions during the SubBytes operation.
-# =============================================================================
-
 print("\n" + "=" * 60)
-print("Attacking Last Round (Hamming Distance Model)")
-print("HD = HW( (CT^k) XOR InvSBox(CT^k) )")
+print("FIRST ROUND ATTACK")
+print("Power Model: HW(SBox(PT ^ k))")
 print("=" * 60)
 
 expected_key = "2b7e151628aed2a6abf7158809cf4f3c"
 expected_bytes = bytes.fromhex(expected_key)
 
-best_key = np.zeros(16, dtype=np.uint8)
-best_correlations = np.zeros(16, dtype=np.float64)
-all_correlations = np.zeros((16, 256), dtype=np.float64)
-correlation_traces = {}
-
-attack_start_time = time.time()
+first_round_key = np.zeros(16, dtype=np.uint8)
+first_round_corr = np.zeros(16, dtype=np.float64)
+first_round_all_corr = np.zeros((16, 256), dtype=np.float64)
+first_round_traces = {}
 
 for byte_idx in range(16):
-    byte_start = time.time()
-    print(f"\nByte {byte_idx:2d}/15: ", end="", flush=True)
+    print(f"Byte {byte_idx:2d}: ", end="", flush=True)
     
-    ct_column = ciphertexts_all[:, byte_idx]
+    pt_column = plaintexts_all[:, byte_idx]
     max_corr = np.zeros(256, dtype=np.float64)
-    best_corr_trace = None
-    best_k = 0
+    best_trace = None
     
-    # Progress indicator
     for kguess in range(256):
         if kguess % 64 == 0:
             print(".", end="", flush=True)
         
-        # S-box input (before InvSubBytes)
-        sbox_input = ct_column ^ kguess
+        # First round: HW(SBox(PT ^ k))
+        inter = SBOX[pt_column ^ kguess]
+        hyp = HW[inter].astype(np.float64)
         
-        # S-box output (after InvSubBytes)  
-        sbox_output = ISBOX[sbox_input]
-        
-        # HAMMING DISTANCE: bit transitions during S-box operation
-        # This is the key difference - we model HD not HW
-        hyp = HW[sbox_input ^ sbox_output].astype(np.float64)
-        
-        # Normalize hypothesis
-        hyp_mean = hyp.mean()
-        hyp_centered = hyp - hyp_mean
-        hyp_std = hyp_centered.std()
-        
+        hyp_c = hyp - hyp.mean()
+        hyp_std = hyp_c.std()
         if hyp_std < 1e-10:
             continue
+        hyp_n = hyp_c / hyp_std
         
-        hyp_norm = hyp_centered / hyp_std
+        corr = np.abs(np.dot(hyp_n, traces_norm) / n_traces)
+        max_corr[kguess] = np.max(corr)
         
-        # Pearson correlation (vectorized for speed)
-        # corr = sum(hyp_norm * trace_norm) / n_traces for each sample
-        corr = np.dot(hyp_norm, traces_norm) / n_traces
-        corr_abs = np.abs(corr)
-        max_corr[kguess] = np.max(corr_abs)
-        
-        if max_corr[kguess] > max_corr[best_k]:
-            best_k = kguess
-            best_corr_trace = corr_abs.copy()
+        if max_corr[kguess] >= max_corr.max():
+            best_trace = corr.copy()
     
     best = np.argmax(max_corr)
-    best_key[byte_idx] = best
-    best_correlations[byte_idx] = max_corr[best]
-    all_correlations[byte_idx] = max_corr
-    correlation_traces[byte_idx] = best_corr_trace
+    first_round_key[byte_idx] = best
+    first_round_corr[byte_idx] = max_corr[best]
+    first_round_all_corr[byte_idx] = max_corr
+    first_round_traces[byte_idx] = best_trace
     
-    # Results for this byte
-    top3 = np.argsort(max_corr)[-3:][::-1]
     match = "[OK]" if best == expected_bytes[byte_idx] else "[X]"
-    byte_time = time.time() - byte_start
-    
-    print(f" 0x{best:02x} {match} (corr={max_corr[best]:.4f}) "
-          f"[2nd: 0x{top3[1]:02x}, 3rd: 0x{top3[2]:02x}] ({byte_time:.1f}s)")
+    print(f" 0x{best:02x} {match} (corr={max_corr[best]:.4f})")
 
-attack_time = time.time() - attack_start_time
+first_key_hex = "".join(f"{b:02x}" for b in first_round_key)
+first_matches = sum(1 for i in range(16) if first_round_key[i] == expected_bytes[i])
+print(f"\nFirst Round Key: {first_key_hex}")
+print(f"Expected:        {expected_key}")
+print(f"Matches: {first_matches}/16, Avg correlation: {first_round_corr.mean():.4f}")
+
+# =============================================================================
+# Last Round Attack: HW(InvSBox(CT ^ k))
+# Recovers Round 10 key, then applies inverse key schedule
+# =============================================================================
+print("\n" + "=" * 60)
+print("LAST ROUND ATTACK")
+print("Power Model: HW(InvSBox(CT ^ k))")
+print("Note: Recovers round 10 key, then applies inverse key schedule")
+print("=" * 60)
+
+# Focus on last portion of traces where round 10 occurs
+# The last round is at the END of the AES operation
+poi_start = int(n_samples * 0.8)  # Last 20% of trace
+poi_end = n_samples
+print(f"Using samples {poi_start} to {poi_end} (last round region)")
+
+traces_last = traces_all[:, poi_start:poi_end]
+traces_last_mean = traces_last.mean(axis=0)
+traces_last_std = traces_last.std(axis=0)
+traces_last_std[traces_last_std < 1e-10] = 1.0
+traces_last_norm = (traces_last - traces_last_mean) / traces_last_std
+
+last_round_key = np.zeros(16, dtype=np.uint8)
+last_round_corr = np.zeros(16, dtype=np.float64)
+last_round_all_corr = np.zeros((16, 256), dtype=np.float64)
+last_round_traces = {}
+
+for byte_idx in range(16):
+    print(f"Byte {byte_idx:2d}: ", end="", flush=True)
+    
+    # Get the correct ciphertext byte considering InvShiftRows
+    # When attacking byte i of the key, we use ct[INVSHIFT[i]]
+    ct_byte_idx = INVSHIFT[byte_idx]
+    ct_column = ciphertexts_all[:, ct_byte_idx]
+    
+    max_corr = np.zeros(256, dtype=np.float64)
+    best_trace = None
+    
+    for kguess in range(256):
+        if kguess % 64 == 0:
+            print(".", end="", flush=True)
+        
+        # Last round: HW(InvSBox(CT ^ k))
+        # This is the state BEFORE the last SubBytes (state9)
+        inter = ISBOX[ct_column ^ kguess]
+        hyp = HW[inter].astype(np.float64)
+        
+        hyp_c = hyp - hyp.mean()
+        hyp_std = hyp_c.std()
+        if hyp_std < 1e-10:
+            continue
+        hyp_n = hyp_c / hyp_std
+        
+        corr = np.abs(np.dot(hyp_n, traces_last_norm) / n_traces)
+        max_corr[kguess] = np.max(corr)
+        
+        if max_corr[kguess] >= max_corr.max():
+            best_trace = corr.copy()
+    
+    best = np.argmax(max_corr)
+    last_round_key[byte_idx] = best
+    last_round_corr[byte_idx] = max_corr[best]
+    last_round_all_corr[byte_idx] = max_corr
+    last_round_traces[byte_idx] = best_trace
+    
+    print(f" 0x{best:02x} (corr={max_corr[best]:.4f})")
+
+last_key_hex = "".join(f"{b:02x}" for b in last_round_key)
+print(f"\nRecovered Round 10 Key: {last_key_hex}")
+print(f"Avg correlation: {last_round_corr.mean():.4f}")
+
+# Apply inverse key schedule to get round 0 key
+print("\nApplying inverse key schedule (round 10 -> round 0)...")
+try:
+    original_key = key_schedule_rounds(last_round_key, 10, 0)
+    original_key_hex = original_key.hex()
+    last_matches = sum(1 for i in range(16) if original_key[i] == expected_bytes[i])
+    print(f"Original Key (round 0): {original_key_hex}")
+    print(f"Expected:               {expected_key}")
+    print(f"Matches: {last_matches}/16")
+except Exception as e:
+    print(f"Key schedule error: {e}")
+    original_key_hex = "error"
+    last_matches = 0
 
 # =============================================================================
 # Results Summary
 # =============================================================================
 print("\n" + "=" * 60)
-print("RESULTS")
+print("SUMMARY")
 print("=" * 60)
+print(f"\nFirst Round Attack:")
+print(f"  Key: {first_key_hex}")
+print(f"  Matches: {first_matches}/16")
+print(f"  Avg Correlation: {first_round_corr.mean():.4f}")
 
-key_hex = "".join(f"{b:02x}" for b in best_key)
-matches = sum(1 for i in range(16) if best_key[i] == expected_bytes[i])
+print(f"\nLast Round Attack:")
+print(f"  Round 10 Key: {last_key_hex}")
+print(f"  Original Key: {original_key_hex}")
+print(f"  Matches: {last_matches}/16")
+print(f"  Avg Correlation: {last_round_corr.mean():.4f}")
 
-print(f"\nRecovered key: {key_hex}")
-print(f"Expected key:  {expected_key}")
-print(f"\nMatching bytes: {matches}/16")
-print(f"Average correlation: {best_correlations.mean():.4f}")
-print(f"Min correlation: {best_correlations.min():.4f} (byte {np.argmin(best_correlations)})")
-print(f"Max correlation: {best_correlations.max():.4f} (byte {np.argmax(best_correlations)})")
-print(f"Attack time: {attack_time:.1f} seconds")
-
-if matches == 16:
-    print("\n*** KEY SUCCESSFULLY RECOVERED! ***")
+if first_matches == 16:
+    print("\n*** FIRST ROUND ATTACK SUCCESSFUL! ***")
+if last_matches == 16:
+    print("\n*** LAST ROUND ATTACK SUCCESSFUL! ***")
 
 # =============================================================================
-# FIGURE 1: Power Consumption Traces
+# Generate Graphs
 # =============================================================================
 print("\n" + "=" * 60)
 print("Generating Graphs...")
 print("=" * 60)
 
-print("\n1. Power consumption traces...")
+# Figure 1: Power Traces
+print("1. Power consumption traces...")
 fig1, axes1 = plt.subplots(2, 1, figsize=(14, 8))
 
-# Overlaid traces
 ax = axes1[0]
 for i in range(min(50, n_traces)):
     ax.plot(traces_all[i], alpha=0.3, linewidth=0.5, color='blue')
-ax.set_xlabel('Sample Number', fontsize=12)
-ax.set_ylabel('Power (ADC counts)', fontsize=12)
-ax.set_title(f'Power Consumption Traces (50 of {n_traces} traces)', fontsize=14)
+ax.axvline(poi_start, color='red', linestyle='--', linewidth=2, label=f'Last Round Start ({poi_start})')
+ax.set_xlabel('Sample Number')
+ax.set_ylabel('Power (ADC counts)')
+ax.set_title(f'Power Consumption Traces ({min(50, n_traces)} traces)')
+ax.legend()
 ax.grid(True, alpha=0.3)
 
-# Mean trace
 ax = axes1[1]
-ax.plot(traces_mean, 'b-', linewidth=1, label='Mean trace')
-ax.fill_between(range(n_samples), 
-                traces_mean - traces_all.std(axis=0), 
-                traces_mean + traces_all.std(axis=0),
-                alpha=0.3, color='blue', label='+/- 1 std dev')
-ax.set_xlabel('Sample Number', fontsize=12)
-ax.set_ylabel('Power (ADC counts)', fontsize=12)
-ax.set_title('Mean Power Trace with Standard Deviation', fontsize=14)
+ax.plot(traces_mean, 'b-', linewidth=1)
+ax.axvline(poi_start, color='red', linestyle='--', linewidth=2, label='Last Round Region')
+ax.axvspan(poi_start, poi_end, alpha=0.2, color='red')
+ax.set_xlabel('Sample Number')
+ax.set_ylabel('Power (ADC counts)')
+ax.set_title('Mean Power Trace')
 ax.legend()
 ax.grid(True, alpha=0.3)
 
@@ -272,123 +370,90 @@ plt.tight_layout()
 plt.savefig("power_traces.png", dpi=150, bbox_inches='tight')
 print("   Saved: power_traces.png")
 
-# =============================================================================
-# FIGURE 2: Correlation Traces for Last Round
-# =============================================================================
-print("2. Correlation traces...")
-
+# Figure 2: First Round Correlation Traces
+print("2. First round correlation traces...")
 fig2, axes2 = plt.subplots(4, 4, figsize=(16, 12))
-
 for byte_idx in range(16):
     row, col = byte_idx // 4, byte_idx % 4
     ax = axes2[row, col]
-    
-    corr_trace = correlation_traces[byte_idx]
-    if corr_trace is not None:
-        ax.plot(corr_trace, 'b-', linewidth=0.5)
-        peak_idx = np.argmax(corr_trace)
-        peak_val = corr_trace[peak_idx]
-        ax.plot(peak_idx, peak_val, 'r*', markersize=8)
-        ax.axhline(peak_val, color='red', linestyle='--', alpha=0.3, linewidth=0.5)
-    
-    match = "[OK]" if best_key[byte_idx] == expected_bytes[byte_idx] else "[X]"
-    ax.set_title(f'Byte {byte_idx}: 0x{best_key[byte_idx]:02X} {match} (r={best_correlations[byte_idx]:.3f})', fontsize=9)
+    if first_round_traces[byte_idx] is not None:
+        ax.plot(first_round_traces[byte_idx], 'b-', linewidth=0.5)
+        peak_idx = np.argmax(first_round_traces[byte_idx])
+        ax.plot(peak_idx, first_round_traces[byte_idx][peak_idx], 'r*', markersize=8)
+    match = "[OK]" if first_round_key[byte_idx] == expected_bytes[byte_idx] else "[X]"
+    ax.set_title(f'Byte {byte_idx}: 0x{first_round_key[byte_idx]:02X} {match}', fontsize=9)
     ax.set_xlabel('Sample', fontsize=8)
-    ax.set_ylabel('|Correlation|', fontsize=8)
+    ax.set_ylabel('|Corr|', fontsize=8)
     ax.grid(True, alpha=0.3)
-
-plt.suptitle('Correlation Traces - Last Round CPA (Hamming Distance Model)', fontsize=14, fontweight='bold')
+plt.suptitle(f'First Round CPA - Correlation Traces\nKey: {first_key_hex}', fontsize=12, fontweight='bold')
 plt.tight_layout()
-plt.savefig("correlation_traces.png", dpi=150, bbox_inches='tight')
-print("   Saved: correlation_traces.png")
+plt.savefig("correlation_traces_first_round.png", dpi=150, bbox_inches='tight')
+print("   Saved: correlation_traces_first_round.png")
 
-# =============================================================================
-# FIGURE 3: Key Candidate Correlations
-# =============================================================================
-print("3. Key candidate correlations...")
-
+# Figure 3: Last Round Correlation Traces
+print("3. Last round correlation traces...")
 fig3, axes3 = plt.subplots(4, 4, figsize=(16, 12))
-
 for byte_idx in range(16):
     row, col = byte_idx // 4, byte_idx % 4
     ax = axes3[row, col]
-    
-    correlations = all_correlations[byte_idx]
-    colors = ['steelblue'] * 256
-    colors[best_key[byte_idx]] = 'red'
-    if expected_bytes[byte_idx] != best_key[byte_idx]:
-        colors[expected_bytes[byte_idx]] = 'green'
-    
-    ax.bar(range(256), correlations, color=colors, alpha=0.7, width=1.0)
-    ax.axvline(best_key[byte_idx], color='red', linestyle='--', linewidth=1)
-    
-    ax.set_title(f'Byte {byte_idx}: 0x{best_key[byte_idx]:02X} (exp: 0x{expected_bytes[byte_idx]:02X})', fontsize=9)
-    ax.set_xlabel('Key Guess', fontsize=8)
-    ax.set_ylabel('Max |Corr|', fontsize=8)
-    ax.set_xlim([0, 255])
-
-plt.suptitle('Key Candidate Correlations (Red=Recovered, Green=Expected)', fontsize=14, fontweight='bold')
+    if last_round_traces[byte_idx] is not None:
+        ax.plot(last_round_traces[byte_idx], 'b-', linewidth=0.5)
+        peak_idx = np.argmax(last_round_traces[byte_idx])
+        ax.plot(peak_idx, last_round_traces[byte_idx][peak_idx], 'r*', markersize=8)
+    ax.set_title(f'Byte {byte_idx}: 0x{last_round_key[byte_idx]:02X} (r={last_round_corr[byte_idx]:.3f})', fontsize=9)
+    ax.set_xlabel('Sample', fontsize=8)
+    ax.set_ylabel('|Corr|', fontsize=8)
+    ax.grid(True, alpha=0.3)
+plt.suptitle(f'Last Round CPA - Correlation Traces\nRound 10 Key: {last_key_hex}', fontsize=12, fontweight='bold')
 plt.tight_layout()
-plt.savefig("key_correlations.png", dpi=150, bbox_inches='tight')
-print("   Saved: key_correlations.png")
+plt.savefig("correlation_traces_last_round.png", dpi=150, bbox_inches='tight')
+print("   Saved: correlation_traces_last_round.png")
 
-# =============================================================================
-# FIGURE 4: Summary for Professor
-# =============================================================================
+# Figure 4: Summary
 print("4. Summary figure...")
-
 fig4, axes4 = plt.subplots(2, 2, figsize=(14, 10))
 
 # Power traces
 ax = axes4[0, 0]
 for i in range(min(20, n_traces)):
     ax.plot(traces_all[i], alpha=0.4, linewidth=0.5)
-ax.set_xlabel('Sample Number')
-ax.set_ylabel('Power (ADC counts)')
-ax.set_title('Power Consumption Traces')
+ax.axvspan(poi_start, poi_end, alpha=0.2, color='red', label='Last Round')
+ax.set_xlabel('Sample')
+ax.set_ylabel('Power')
+ax.set_title('Power Traces')
+ax.legend()
 ax.grid(True, alpha=0.3)
 
-# Correlation trace for byte 0
+# First round correlation for byte 0
 ax = axes4[0, 1]
-if correlation_traces[0] is not None:
-    ax.plot(correlation_traces[0], 'b-', linewidth=1)
-    peak_idx = np.argmax(correlation_traces[0])
-    ax.plot(peak_idx, correlation_traces[0][peak_idx], 'r*', markersize=12)
-ax.set_xlabel('Sample Number')
+if first_round_traces[0] is not None:
+    ax.plot(first_round_traces[0], 'b-', linewidth=1)
+ax.set_xlabel('Sample')
 ax.set_ylabel('|Correlation|')
-ax.set_title(f'Correlation Trace - Byte 0 (key=0x{best_key[0]:02X})')
+ax.set_title(f'First Round - Byte 0 (0x{first_round_key[0]:02X})')
 ax.grid(True, alpha=0.3)
 
-# Key candidates for byte 0
+# First round correlations per byte
 ax = axes4[1, 0]
-ax.bar(range(256), all_correlations[0], color='steelblue', alpha=0.7, width=1.0)
-ax.axvline(best_key[0], color='red', linestyle='--', linewidth=2, label=f'Best: 0x{best_key[0]:02X}')
-ax.set_xlabel('Key Guess (0-255)')
-ax.set_ylabel('Max |Correlation|')
-ax.set_title('Key Candidates - Byte 0')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-# Correlation per byte
-ax = axes4[1, 1]
-colors = ['green' if best_key[i] == expected_bytes[i] else 'red' for i in range(16)]
-ax.bar(range(16), best_correlations, color=colors, alpha=0.8)
-ax.axhline(best_correlations.mean(), color='blue', linestyle='--', label=f'Mean: {best_correlations.mean():.4f}')
-ax.set_xlabel('Key Byte Index')
-ax.set_ylabel('Best Correlation')
-ax.set_title('Correlation per Byte (Green=Correct, Red=Wrong)')
+colors = ['green' if first_round_key[i] == expected_bytes[i] else 'red' for i in range(16)]
+ax.bar(range(16), first_round_corr, color=colors, alpha=0.8)
+ax.set_xlabel('Key Byte')
+ax.set_ylabel('Max Correlation')
+ax.set_title(f'First Round: {first_matches}/16 correct')
 ax.set_xticks(range(16))
-ax.legend()
 ax.grid(True, alpha=0.3, axis='y')
 
-fig4.text(0.5, 0.02, 
-          f'Recovered: {key_hex} | Expected: {expected_key} | Matches: {matches}/16',
-          ha='center', fontsize=11, fontweight='bold', family='monospace',
-          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+# Last round correlations per byte
+ax = axes4[1, 1]
+ax.bar(range(16), last_round_corr, color='steelblue', alpha=0.8)
+ax.set_xlabel('Key Byte')
+ax.set_ylabel('Max Correlation')
+ax.set_title(f'Last Round: Avg corr = {last_round_corr.mean():.4f}')
+ax.set_xticks(range(16))
+ax.grid(True, alpha=0.3, axis='y')
 
-plt.suptitle(f'CPA Attack Summary - Last Round (Hamming Distance)\n{n_traces} traces, {n_samples} samples/trace', 
-             fontsize=14, fontweight='bold')
-plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+plt.suptitle('CPA Attack Summary', fontsize=14, fontweight='bold')
+plt.tight_layout()
 plt.savefig("cpa_summary.png", dpi=150, bbox_inches='tight')
 print("   Saved: cpa_summary.png")
 
@@ -397,8 +462,3 @@ plt.show()
 print("\n" + "=" * 60)
 print("COMPLETE")
 print("=" * 60)
-print("\nOutput files:")
-print("  - power_traces.png")
-print("  - correlation_traces.png")
-print("  - key_correlations.png")
-print("  - cpa_summary.png")
