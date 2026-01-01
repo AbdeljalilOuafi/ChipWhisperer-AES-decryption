@@ -1,18 +1,16 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import chipwhisperer as cw
 import time
 
 # =============================================================================
-# Setup ChipWhisperer Lite with XMEGA CW308 Target
+# Setup
 # =============================================================================
 scope = cw.scope()
 target = cw.target(scope, cw.targets.SimpleSerial)
 scope.default_setup()
 
-# Scope settings for XMEGA target
-scope.clock.clkgen_freq = 7370000  # 7.37 MHz for XMEGA
-scope.adc.samples = 24000          # Capture enough samples for full AES
+scope.clock.clkgen_freq = 7370000
+scope.adc.samples = 24000
 scope.adc.offset = 0
 scope.adc.basic_mode = "rising_edge"
 scope.trigger.triggers = "tio4"
@@ -28,7 +26,7 @@ if hasattr(scope, 'io'):
     time.sleep(0.05)
 
 # =============================================================================
-# AES Tables and Key Schedule
+# AES Tables
 # =============================================================================
 SBOX = np.array([
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
@@ -68,401 +66,106 @@ ISBOX = np.array([
     0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
 ], dtype=np.uint8)
 
-# Hamming Weight lookup
 HW = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
 
-# AES Round Constants
+# Inverse key schedule
 RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
 
-# InvShiftRows mapping: tells which ciphertext byte corresponds to which state byte
-# In the last round: CT = ShiftRows(SubBytes(state9)) XOR key10
-# To undo ShiftRows when attacking, we need this mapping
-INVSHIFT = [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11]
-
-def key_schedule_rounds(key, start_round, end_round):
-    """
-    Apply AES key schedule from start_round to end_round.
-    If start_round > end_round, applies inverse key schedule.
-    """
-    key = np.array(list(key), dtype=np.uint8)
-    
-    if start_round < end_round:
-        # Forward key schedule
-        for r in range(start_round, end_round):
-            # RotWord + SubWord + Rcon for first column
-            temp = np.array([
-                SBOX[key[13]] ^ RCON[r],
-                SBOX[key[14]],
-                SBOX[key[15]],
-                SBOX[key[12]]
-            ], dtype=np.uint8)
-            
-            # XOR with previous round key
-            new_key = np.zeros(16, dtype=np.uint8)
-            new_key[0:4] = key[0:4] ^ temp
-            new_key[4:8] = key[4:8] ^ new_key[0:4]
-            new_key[8:12] = key[8:12] ^ new_key[4:8]
-            new_key[12:16] = key[12:16] ^ new_key[8:12]
-            key = new_key
-    else:
-        # Inverse key schedule (going backwards)
-        for r in range(start_round - 1, end_round - 1, -1):
-            new_key = np.zeros(16, dtype=np.uint8)
-            new_key[12:16] = key[12:16] ^ key[8:12]
-            new_key[8:12] = key[8:12] ^ key[4:8]
-            new_key[4:8] = key[4:8] ^ key[0:4]
-            
-            # Inverse of RotWord + SubWord + Rcon
-            temp = np.array([
-                SBOX[new_key[13]] ^ RCON[r],
-                SBOX[new_key[14]],
-                SBOX[new_key[15]],
-                SBOX[new_key[12]]
-            ], dtype=np.uint8)
-            new_key[0:4] = key[0:4] ^ temp
-            key = new_key
-    
+def inv_key_schedule(key10):
+    """Convert round 10 key back to round 0 key."""
+    key = np.array(list(key10), dtype=np.uint8)
+    for r in range(9, -1, -1):
+        new_key = np.zeros(16, dtype=np.uint8)
+        new_key[12:16] = key[12:16] ^ key[8:12]
+        new_key[8:12] = key[8:12] ^ key[4:8]
+        new_key[4:8] = key[4:8] ^ key[0:4]
+        temp = np.array([SBOX[new_key[13]] ^ RCON[r], SBOX[new_key[14]], 
+                         SBOX[new_key[15]], SBOX[new_key[12]]], dtype=np.uint8)
+        new_key[0:4] = key[0:4] ^ temp
+        key = new_key
     return bytes(key)
 
 # =============================================================================
-# Trace Capture
+# Capture Traces
 # =============================================================================
 print("=" * 60)
-print("CPA Attack on AES")
-print("Target: XMEGA CW308 with TinyAES128")
+print("CPA Last Round Attack - Hamming Distance Model")
+print("HD(CT^k, InvSBox(CT^k))")
 print("=" * 60)
 
 print("\nCapturing traces...")
-N_traces = 2000  # Reduced for faster testing
-traces_all = []
-ciphertexts_all = []
-plaintexts_all = []
+N = 2000
+traces = []
+ciphertexts = []
 
-for i in range(N_traces):
-    pt = bytearray(np.random.randint(0, 256, size=(16,), dtype=np.uint8).tolist())
+for i in range(N):
+    pt = bytearray(np.random.randint(0, 256, 16, dtype=np.uint8).tolist())
     scope.arm()
     target.simpleserial_write('p', pt)
-    ok = scope.capture()
-    
-    if not ok:
+    if not scope.capture():
         trace = scope.get_last_trace()
         ct = target.simpleserial_read('r', 16, timeout=500)
         if ct and len(ct) == 16:
-            traces_all.append(trace.copy())
-            ciphertexts_all.append(list(ct))
-            plaintexts_all.append(list(pt))
-    
+            traces.append(trace.copy())
+            ciphertexts.append(list(ct))
     if (i + 1) % 500 == 0:
-        print(f"  {i + 1}/{N_traces} traces captured")
+        print(f"  {i+1}/{N}")
 
-traces_all = np.array(traces_all, dtype=np.float64)
-ciphertexts_all = np.array(ciphertexts_all, dtype=np.uint8)
-plaintexts_all = np.array(plaintexts_all, dtype=np.uint8)
+traces = np.array(traces, dtype=np.float64)
+ciphertexts = np.array(ciphertexts, dtype=np.uint8)
+n_traces, n_samples = traces.shape
+print(f"Captured: {n_traces} traces, {n_samples} samples each")
 
-n_traces, n_samples = traces_all.shape
-print(f"\nTotal valid traces: {n_traces}")
-print(f"Samples per trace: {n_samples}")
-
-# Normalize traces
-print("Preprocessing traces...")
-traces_mean = traces_all.mean(axis=0)
-traces_std = traces_all.std(axis=0)
-traces_std[traces_std < 1e-10] = 1.0
-traces_norm = (traces_all - traces_mean) / traces_std
+# Normalize
+t_mean = traces.mean(axis=0)
+t_std = traces.std(axis=0)
+t_std[t_std < 1e-10] = 1.0
+traces_norm = (traces - t_mean) / t_std
 
 # =============================================================================
-# First Round Attack: HW(SBox(PT ^ k)) - COMMENTED OUT FOR SPEED
+# Last Round Attack - Hamming Distance: HD(CT^k, InvSBox(CT^k))
 # =============================================================================
-# print("\n" + "=" * 60)
-# print("FIRST ROUND ATTACK")
-# print("Power Model: HW(SBox(PT ^ k))")
-# print("=" * 60)
+print("\nAttacking...")
+expected = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+round10_key = np.zeros(16, dtype=np.uint8)
+correlations = np.zeros(16, dtype=np.float64)
 
-expected_key = "2b7e151628aed2a6abf7158809cf4f3c"
-expected_bytes = bytes.fromhex(expected_key)
-
-# Initialize variables (needed for graphs even if first round is skipped)
-first_round_key = np.zeros(16, dtype=np.uint8)
-first_round_corr = np.zeros(16, dtype=np.float64)
-first_round_all_corr = np.zeros((16, 256), dtype=np.float64)
-first_round_traces = {i: None for i in range(16)}
-first_key_hex = "skipped"
-first_matches = 0
-
-# FIRST ROUND ATTACK COMMENTED OUT - Uncomment below to run it
-# for byte_idx in range(16):
-#     print(f"Byte {byte_idx:2d}: ", end="", flush=True)
-#     
-#     pt_column = plaintexts_all[:, byte_idx]
-#     max_corr = np.zeros(256, dtype=np.float64)
-#     best_trace = None
-#     
-#     for kguess in range(256):
-#         if kguess % 64 == 0:
-#             print(".", end="", flush=True)
-#         
-#         # First round: HW(SBox(PT ^ k))
-#         inter = SBOX[pt_column ^ kguess]
-#         hyp = HW[inter].astype(np.float64)
-#         
-#         hyp_c = hyp - hyp.mean()
-#         hyp_std = hyp_c.std()
-#         if hyp_std < 1e-10:
-#             continue
-#         hyp_n = hyp_c / hyp_std
-#         
-#         corr = np.abs(np.dot(hyp_n, traces_norm) / n_traces)
-#         max_corr[kguess] = np.max(corr)
-#         
-#         if max_corr[kguess] >= max_corr.max():
-#             best_trace = corr.copy()
-#     
-#     best = np.argmax(max_corr)
-#     first_round_key[byte_idx] = best
-#     first_round_corr[byte_idx] = max_corr[best]
-#     first_round_all_corr[byte_idx] = max_corr
-#     first_round_traces[byte_idx] = best_trace
-#     
-#     match = "[OK]" if best == expected_bytes[byte_idx] else "[X]"
-#     print(f" 0x{best:02x} {match} (corr={max_corr[best]:.4f})")
-# 
-# first_key_hex = "".join(f"{b:02x}" for b in first_round_key)
-# first_matches = sum(1 for i in range(16) if first_round_key[i] == expected_bytes[i])
-# print(f"\nFirst Round Key: {first_key_hex}")
-# print(f"Expected:        {expected_key}")
-# print(f"Matches: {first_matches}/16, Avg correlation: {first_round_corr.mean():.4f}")
-
-# =============================================================================
-# Last Round Attack: HW(InvSBox(CT ^ k))
-# Recovers Round 10 key, then applies inverse key schedule
-# =============================================================================
-print("\n" + "=" * 60)
-print("LAST ROUND ATTACK")
-print("Power Model: HW(InvSBox(CT ^ k))")
-print("Note: Recovers round 10 key, then applies inverse key schedule")
-print("=" * 60)
-
-# Search the ENTIRE trace to find where last round leakage is
-# This helps identify if the issue is timing/capture settings
-print("Searching ENTIRE trace for last round leakage...")
-
-last_round_key = np.zeros(16, dtype=np.uint8)
-last_round_corr = np.zeros(16, dtype=np.float64)
-last_round_all_corr = np.zeros((16, 256), dtype=np.float64)
-last_round_traces = {}
-last_round_peak_samples = np.zeros(16, dtype=np.int32)
-
-for byte_idx in range(16):
-    print(f"Byte {byte_idx:2d}: ", end="", flush=True)
-    
-    # For last round, we DON'T need INVSHIFT - that's only for matching
-    # We attack each ciphertext byte directly with its corresponding key byte
-    ct_column = ciphertexts_all[:, byte_idx]
-    
+for b in range(16):
+    ct_col = ciphertexts[:, b]
     max_corr = np.zeros(256, dtype=np.float64)
-    best_trace = None
-    best_peak_sample = 0
     
-    for kguess in range(256):
-        if kguess % 64 == 0:
-            print(".", end="", flush=True)
+    for k in range(256):
+        # Hamming Distance: HD(CT^k, InvSBox(CT^k))
+        sbox_in = ct_col ^ k
+        sbox_out = ISBOX[sbox_in]
+        hyp = HW[sbox_in ^ sbox_out].astype(np.float64)  # HD between input and output
         
-        # Last round: HW(InvSBox(CT ^ k))
-        inter = ISBOX[ct_column ^ kguess]
-        hyp = HW[inter].astype(np.float64)
-        
+        # Normalize and correlate
         hyp_c = hyp - hyp.mean()
-        hyp_std = hyp_c.std()
-        if hyp_std < 1e-10:
+        if hyp_c.std() < 1e-10:
             continue
-        hyp_n = hyp_c / hyp_std
-        
-        # Search entire trace
+        hyp_n = hyp_c / hyp_c.std()
         corr = np.abs(np.dot(hyp_n, traces_norm) / n_traces)
-        max_corr[kguess] = np.max(corr)
-        
-        if max_corr[kguess] >= max_corr.max():
-            best_trace = corr.copy()
-            best_peak_sample = np.argmax(corr)
+        max_corr[k] = np.max(corr)
     
     best = np.argmax(max_corr)
-    last_round_key[byte_idx] = best
-    last_round_corr[byte_idx] = max_corr[best]
-    last_round_all_corr[byte_idx] = max_corr
-    last_round_traces[byte_idx] = best_trace
-    last_round_peak_samples[byte_idx] = best_peak_sample
-    
-    print(f" 0x{best:02x} (corr={max_corr[best]:.4f}) @ sample {best_peak_sample}")
+    round10_key[b] = best
+    correlations[b] = max_corr[best]
+    print(f"Byte {b:2d}: 0x{best:02x} (corr={max_corr[best]:.4f})")
 
-last_key_hex = "".join(f"{b:02x}" for b in last_round_key)
-print(f"\nRecovered Round 10 Key: {last_key_hex}")
-print(f"Avg correlation: {last_round_corr.mean():.4f}")
-print(f"Peak samples range: {last_round_peak_samples.min()} to {last_round_peak_samples.max()}")
-print(f"(If peaks are near start of trace, last round is in first round region = wrong capture timing)")
-
-# Apply inverse key schedule to get round 0 key
-print("\nApplying inverse key schedule (round 10 -> round 0)...")
-try:
-    original_key = key_schedule_rounds(last_round_key, 10, 0)
-    original_key_hex = original_key.hex()
-    last_matches = sum(1 for i in range(16) if original_key[i] == expected_bytes[i])
-    print(f"Original Key (round 0): {original_key_hex}")
-    print(f"Expected:               {expected_key}")
-    print(f"Matches: {last_matches}/16")
-except Exception as e:
-    print(f"Key schedule error: {e}")
-    original_key_hex = "error"
-    last_matches = 0
-
-# =============================================================================
-# Results Summary
-# =============================================================================
+# Results
 print("\n" + "=" * 60)
-print("SUMMARY")
-print("=" * 60)
-print(f"\nFirst Round Attack:")
-print(f"  Key: {first_key_hex}")
-print(f"  Matches: {first_matches}/16")
-print(f"  Avg Correlation: {first_round_corr.mean():.4f}")
+round10_hex = round10_key.tobytes().hex()
+print(f"Round 10 Key: {round10_hex}")
+print(f"Avg correlation: {correlations.mean():.4f}")
 
-print(f"\nLast Round Attack:")
-print(f"  Round 10 Key: {last_key_hex}")
-print(f"  Original Key: {original_key_hex}")
-print(f"  Matches: {last_matches}/16")
-print(f"  Avg Correlation: {last_round_corr.mean():.4f}")
+# Convert to original key
+original = inv_key_schedule(round10_key)
+print(f"\nOriginal Key:  {original.hex()}")
+print(f"Expected:      {expected.hex()}")
+matches = sum(1 for i in range(16) if original[i] == expected[i])
+print(f"Matches: {matches}/16")
 
-if first_matches == 16:
-    print("\n*** FIRST ROUND ATTACK SUCCESSFUL! ***")
-if last_matches == 16:
-    print("\n*** LAST ROUND ATTACK SUCCESSFUL! ***")
-
-# =============================================================================
-# Generate Graphs
-# =============================================================================
-print("\n" + "=" * 60)
-print("Generating Graphs...")
-print("=" * 60)
-
-# Figure 1: Power Traces
-print("1. Power consumption traces...")
-fig1, axes1 = plt.subplots(2, 1, figsize=(14, 8))
-
-ax = axes1[0]
-for i in range(min(50, n_traces)):
-    ax.plot(traces_all[i], alpha=0.3, linewidth=0.5, color='blue')
-# Mark where last round peaks were found
-for peak in last_round_peak_samples:
-    ax.axvline(peak, color='red', alpha=0.3, linewidth=0.5)
-ax.set_xlabel('Sample Number')
-ax.set_ylabel('Power (ADC counts)')
-ax.set_title(f'Power Consumption Traces ({min(50, n_traces)} traces) - Red lines = Last Round peaks')
-ax.grid(True, alpha=0.3)
-
-ax = axes1[1]
-ax.plot(traces_mean, 'b-', linewidth=1)
-# Show where correlation peaks were found for last round
-peak_min, peak_max = last_round_peak_samples.min(), last_round_peak_samples.max()
-ax.axvspan(peak_min, peak_max, alpha=0.2, color='red', label=f'Last Round peaks ({peak_min}-{peak_max})')
-ax.set_xlabel('Sample Number')
-ax.set_ylabel('Power (ADC counts)')
-ax.set_title('Mean Power Trace')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig("power_traces.png", dpi=150, bbox_inches='tight')
-print("   Saved: power_traces.png")
-
-# Figure 2: First Round Correlation Traces
-print("2. First round correlation traces...")
-fig2, axes2 = plt.subplots(4, 4, figsize=(16, 12))
-for byte_idx in range(16):
-    row, col = byte_idx // 4, byte_idx % 4
-    ax = axes2[row, col]
-    if first_round_traces[byte_idx] is not None:
-        ax.plot(first_round_traces[byte_idx], 'b-', linewidth=0.5)
-        peak_idx = np.argmax(first_round_traces[byte_idx])
-        ax.plot(peak_idx, first_round_traces[byte_idx][peak_idx], 'r*', markersize=8)
-    match = "[OK]" if first_round_key[byte_idx] == expected_bytes[byte_idx] else "[X]"
-    ax.set_title(f'Byte {byte_idx}: 0x{first_round_key[byte_idx]:02X} {match}', fontsize=9)
-    ax.set_xlabel('Sample', fontsize=8)
-    ax.set_ylabel('|Corr|', fontsize=8)
-    ax.grid(True, alpha=0.3)
-plt.suptitle(f'First Round CPA - Correlation Traces\nKey: {first_key_hex}', fontsize=12, fontweight='bold')
-plt.tight_layout()
-plt.savefig("correlation_traces_first_round.png", dpi=150, bbox_inches='tight')
-print("   Saved: correlation_traces_first_round.png")
-
-# Figure 3: Last Round Correlation Traces
-print("3. Last round correlation traces...")
-fig3, axes3 = plt.subplots(4, 4, figsize=(16, 12))
-for byte_idx in range(16):
-    row, col = byte_idx // 4, byte_idx % 4
-    ax = axes3[row, col]
-    if last_round_traces[byte_idx] is not None:
-        ax.plot(last_round_traces[byte_idx], 'b-', linewidth=0.5)
-        peak_idx = np.argmax(last_round_traces[byte_idx])
-        ax.plot(peak_idx, last_round_traces[byte_idx][peak_idx], 'r*', markersize=8)
-    ax.set_title(f'Byte {byte_idx}: 0x{last_round_key[byte_idx]:02X} (r={last_round_corr[byte_idx]:.3f})', fontsize=9)
-    ax.set_xlabel('Sample', fontsize=8)
-    ax.set_ylabel('|Corr|', fontsize=8)
-    ax.grid(True, alpha=0.3)
-plt.suptitle(f'Last Round CPA - Correlation Traces\nRound 10 Key: {last_key_hex}', fontsize=12, fontweight='bold')
-plt.tight_layout()
-plt.savefig("correlation_traces_last_round.png", dpi=150, bbox_inches='tight')
-print("   Saved: correlation_traces_last_round.png")
-
-# Figure 4: Summary
-print("4. Summary figure...")
-fig4, axes4 = plt.subplots(2, 2, figsize=(14, 10))
-
-# Power traces
-ax = axes4[0, 0]
-for i in range(min(20, n_traces)):
-    ax.plot(traces_all[i], alpha=0.4, linewidth=0.5)
-peak_min, peak_max = last_round_peak_samples.min(), last_round_peak_samples.max()
-ax.axvspan(peak_min, peak_max, alpha=0.2, color='red', label=f'Last Round peaks')
-ax.set_xlabel('Sample')
-ax.set_ylabel('Power')
-ax.set_title('Power Traces')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-# First round correlation for byte 0
-ax = axes4[0, 1]
-if first_round_traces[0] is not None:
-    ax.plot(first_round_traces[0], 'b-', linewidth=1)
-ax.set_xlabel('Sample')
-ax.set_ylabel('|Correlation|')
-ax.set_title(f'First Round - Byte 0 (0x{first_round_key[0]:02X})')
-ax.grid(True, alpha=0.3)
-
-# First round correlations per byte
-ax = axes4[1, 0]
-colors = ['green' if first_round_key[i] == expected_bytes[i] else 'red' for i in range(16)]
-ax.bar(range(16), first_round_corr, color=colors, alpha=0.8)
-ax.set_xlabel('Key Byte')
-ax.set_ylabel('Max Correlation')
-ax.set_title(f'First Round: {first_matches}/16 correct')
-ax.set_xticks(range(16))
-ax.grid(True, alpha=0.3, axis='y')
-
-# Last round correlations per byte
-ax = axes4[1, 1]
-ax.bar(range(16), last_round_corr, color='steelblue', alpha=0.8)
-ax.set_xlabel('Key Byte')
-ax.set_ylabel('Max Correlation')
-ax.set_title(f'Last Round: Avg corr = {last_round_corr.mean():.4f}')
-ax.set_xticks(range(16))
-ax.grid(True, alpha=0.3, axis='y')
-
-plt.suptitle('CPA Attack Summary', fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.savefig("cpa_summary.png", dpi=150, bbox_inches='tight')
-print("   Saved: cpa_summary.png")
-
-plt.show()
-
-print("\n" + "=" * 60)
-print("COMPLETE")
+if matches == 16:
+    print("\n*** SUCCESS! ***")
 print("=" * 60)
