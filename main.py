@@ -238,40 +238,32 @@ print("Power Model: HW(InvSBox(CT ^ k))")
 print("Note: Recovers round 10 key, then applies inverse key schedule")
 print("=" * 60)
 
-# Focus on last portion of traces where round 10 occurs
-# The last round is at the END of the AES operation
-poi_start = int(n_samples * 0.8)  # Last 20% of trace
-poi_end = n_samples
-print(f"Using samples {poi_start} to {poi_end} (last round region)")
-
-traces_last = traces_all[:, poi_start:poi_end]
-traces_last_mean = traces_last.mean(axis=0)
-traces_last_std = traces_last.std(axis=0)
-traces_last_std[traces_last_std < 1e-10] = 1.0
-traces_last_norm = (traces_last - traces_last_mean) / traces_last_std
+# Search the ENTIRE trace to find where last round leakage is
+# This helps identify if the issue is timing/capture settings
+print("Searching ENTIRE trace for last round leakage...")
 
 last_round_key = np.zeros(16, dtype=np.uint8)
 last_round_corr = np.zeros(16, dtype=np.float64)
 last_round_all_corr = np.zeros((16, 256), dtype=np.float64)
 last_round_traces = {}
+last_round_peak_samples = np.zeros(16, dtype=np.int32)
 
 for byte_idx in range(16):
     print(f"Byte {byte_idx:2d}: ", end="", flush=True)
     
-    # Get the correct ciphertext byte considering InvShiftRows
-    # When attacking byte i of the key, we use ct[INVSHIFT[i]]
-    ct_byte_idx = INVSHIFT[byte_idx]
-    ct_column = ciphertexts_all[:, ct_byte_idx]
+    # For last round, we DON'T need INVSHIFT - that's only for matching
+    # We attack each ciphertext byte directly with its corresponding key byte
+    ct_column = ciphertexts_all[:, byte_idx]
     
     max_corr = np.zeros(256, dtype=np.float64)
     best_trace = None
+    best_peak_sample = 0
     
     for kguess in range(256):
         if kguess % 64 == 0:
             print(".", end="", flush=True)
         
         # Last round: HW(InvSBox(CT ^ k))
-        # This is the state BEFORE the last SubBytes (state9)
         inter = ISBOX[ct_column ^ kguess]
         hyp = HW[inter].astype(np.float64)
         
@@ -281,23 +273,28 @@ for byte_idx in range(16):
             continue
         hyp_n = hyp_c / hyp_std
         
-        corr = np.abs(np.dot(hyp_n, traces_last_norm) / n_traces)
+        # Search entire trace
+        corr = np.abs(np.dot(hyp_n, traces_norm) / n_traces)
         max_corr[kguess] = np.max(corr)
         
         if max_corr[kguess] >= max_corr.max():
             best_trace = corr.copy()
+            best_peak_sample = np.argmax(corr)
     
     best = np.argmax(max_corr)
     last_round_key[byte_idx] = best
     last_round_corr[byte_idx] = max_corr[best]
     last_round_all_corr[byte_idx] = max_corr
     last_round_traces[byte_idx] = best_trace
+    last_round_peak_samples[byte_idx] = best_peak_sample
     
-    print(f" 0x{best:02x} (corr={max_corr[best]:.4f})")
+    print(f" 0x{best:02x} (corr={max_corr[best]:.4f}) @ sample {best_peak_sample}")
 
 last_key_hex = "".join(f"{b:02x}" for b in last_round_key)
 print(f"\nRecovered Round 10 Key: {last_key_hex}")
 print(f"Avg correlation: {last_round_corr.mean():.4f}")
+print(f"Peak samples range: {last_round_peak_samples.min()} to {last_round_peak_samples.max()}")
+print(f"(If peaks are near start of trace, last round is in first round region = wrong capture timing)")
 
 # Apply inverse key schedule to get round 0 key
 print("\nApplying inverse key schedule (round 10 -> round 0)...")
@@ -349,17 +346,19 @@ fig1, axes1 = plt.subplots(2, 1, figsize=(14, 8))
 ax = axes1[0]
 for i in range(min(50, n_traces)):
     ax.plot(traces_all[i], alpha=0.3, linewidth=0.5, color='blue')
-ax.axvline(poi_start, color='red', linestyle='--', linewidth=2, label=f'Last Round Start ({poi_start})')
+# Mark where last round peaks were found
+for peak in last_round_peak_samples:
+    ax.axvline(peak, color='red', alpha=0.3, linewidth=0.5)
 ax.set_xlabel('Sample Number')
 ax.set_ylabel('Power (ADC counts)')
-ax.set_title(f'Power Consumption Traces ({min(50, n_traces)} traces)')
-ax.legend()
+ax.set_title(f'Power Consumption Traces ({min(50, n_traces)} traces) - Red lines = Last Round peaks')
 ax.grid(True, alpha=0.3)
 
 ax = axes1[1]
 ax.plot(traces_mean, 'b-', linewidth=1)
-ax.axvline(poi_start, color='red', linestyle='--', linewidth=2, label='Last Round Region')
-ax.axvspan(poi_start, poi_end, alpha=0.2, color='red')
+# Show where correlation peaks were found for last round
+peak_min, peak_max = last_round_peak_samples.min(), last_round_peak_samples.max()
+ax.axvspan(peak_min, peak_max, alpha=0.2, color='red', label=f'Last Round peaks ({peak_min}-{peak_max})')
 ax.set_xlabel('Sample Number')
 ax.set_ylabel('Power (ADC counts)')
 ax.set_title('Mean Power Trace')
@@ -417,7 +416,8 @@ fig4, axes4 = plt.subplots(2, 2, figsize=(14, 10))
 ax = axes4[0, 0]
 for i in range(min(20, n_traces)):
     ax.plot(traces_all[i], alpha=0.4, linewidth=0.5)
-ax.axvspan(poi_start, poi_end, alpha=0.2, color='red', label='Last Round')
+peak_min, peak_max = last_round_peak_samples.min(), last_round_peak_samples.max()
+ax.axvspan(peak_min, peak_max, alpha=0.2, color='red', label=f'Last Round peaks')
 ax.set_xlabel('Sample')
 ax.set_ylabel('Power')
 ax.set_title('Power Traces')
